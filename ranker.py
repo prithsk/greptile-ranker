@@ -82,7 +82,7 @@ def _key(r): return r["pr"] + "|" + str(r["idx"])
 def label(model="gpt-4o-mini"):
     need("OPENAI_API_KEY")
     from openai import OpenAI
-    client = OpenAI(); rows = [json.loads(l) for l in DATA.read_text(encoding="utf-8").splitlines()]
+    client = OpenAI(max_retries=8); rows = [json.loads(l) for l in DATA.read_text(encoding="utf-8").splitlines()]
     done = {json.loads(l)["key"] for l in LABELS.read_text(encoding="utf-8").splitlines()} if LABELS.exists() else set()
     with LABELS.open("a", encoding="utf-8") as out:
         for n, r in enumerate(rows, 1):
@@ -204,9 +204,82 @@ def evaluate(folds=5, seed=3, data=None, out_dir=None):
     out = "\n".join(md); Path(out_dir).mkdir(parents=True, exist_ok=True); (Path(out_dir) / f"{dt.date.today()}.md").write_text(out, encoding="utf-8"); print(out)
     return res
 
+
+TIMELINE = ROOT / "data" / "timelines.jsonl"
+
+def timeline():
+    """For every PR already collected, record when Greptile reviewed and every commit's time and files after that."""
+    need("GITHUB_TOKEN")
+    prs = sorted({json.loads(l)["pr"] for l in DATA.read_text(encoding="utf-8").splitlines()})
+    done = {json.loads(l)["pr"] for l in TIMELINE.read_text(encoding="utf-8").splitlines()} if TIMELINE.exists() else set()
+    with TIMELINE.open("a", encoding="utf-8") as out:
+        for n, url in enumerate(prs, 1):
+            if url in done: continue
+            parts = url.rstrip("/").split("/"); repo, num = parts[-4] + "/" + parts[-3], parts[-1]
+            try:
+                gc = [{"t": c["created_at"], "path": c.get("path")} for c in get(f"{API}/repos/{repo}/pulls/{num}/comments", per_page=100)
+                      if "greptile" in (c.get("user") or {}).get("login", "").lower()]
+                commits = []
+                for c in get(f"{API}/repos/{repo}/pulls/{num}/commits", per_page=100):
+                    commits.append({"t": c["commit"]["committer"]["date"], "files": sorted({f["filename"] for f in get(c["url"]).get("files", [])})})
+            except requests.HTTPError as e:
+                print(f"  skip {url}: {e}"); continue
+            out.write(json.dumps({"pr": url, "repo": repo, "greptile": gc, "commits": commits}) + "\n")
+            if n % 10 == 0: print(f"  {n}/{len(prs)} PRs", flush=True)
+
+def churn_rates(tl):
+    """Per PR: commented files vs files Greptile never flagged, each judged by whether a commit after the review touched it."""
+    rows = []
+    for r in tl:
+        if not r["greptile"] or not r["commits"]: continue
+        t0 = min(g["t"] for g in r["greptile"])
+        flagged = {g["path"] for g in r["greptile"] if g["path"]}
+        before = [c for c in r["commits"] if c["t"] <= t0]; after = [c for c in r["commits"] if c["t"] > t0]
+        in_pr = {f for c in before for f in c["files"]}                 # files the PR had already changed when Greptile reviewed
+        touched_after = {f for c in after for f in c["files"]}
+        prior = {f: sum(f in c["files"] for c in before) for f in in_pr}
+        for f in in_pr:
+            rows.append({"pr": r["pr"], "flagged": f in flagged, "after": f in touched_after, "busy": prior[f] >= 2})
+    return rows
+
+def control(seed=7):
+    tl = [json.loads(l) for l in TIMELINE.read_text(encoding="utf-8").splitlines()]
+    rows = churn_rates(tl)
+    def rate(sel): g = [x["after"] for x in rows if sel(x)]; return (sum(g) / len(g), len(g)) if g else (float("nan"), 0)
+    f_rate, f_n = rate(lambda x: x["flagged"]); u_rate, u_n = rate(lambda x: not x["flagged"])
+    prs = sorted({x["pr"] for x in rows}); by = {}
+    for x in rows: by.setdefault(x["pr"], []).append(x)
+    rng = random.Random(seed); diffs = []
+    for _ in range(2000):                                               # bootstrap over whole PRs
+        pick = [x for p in (rng.choice(prs) for _ in prs) for x in by[p]]
+        a = [x["after"] for x in pick if x["flagged"]]; b = [x["after"] for x in pick if not x["flagged"]]
+        if a and b: diffs.append(sum(a) / len(a) - sum(b) / len(b))
+    diffs.sort(); lo, hi = diffs[int(0.025 * len(diffs))], diffs[int(0.975 * len(diffs))]
+    strata = []
+    for name, sel in (("Files changed once before the review", lambda x: not x["busy"]), ("Files changed 2+ times before the review", lambda x: x["busy"])):
+        a, an = rate(lambda x, s=sel: s(x) and x["flagged"]); b, bn = rate(lambda x, s=sel: s(x) and not x["flagged"])
+        strata.append((name, a, an, b, bn))
+    md = [f"# Greptile's addressed rate against a control group, {dt.date.today()}", "",
+          f"{len(prs)} merged PRs. For each PR, every file the PR had changed by the time Greptile reviewed it, split into files Greptile commented on and files it didn't. "
+          "A file counts as changed afterward if any later commit on the PR touched it, which is Greptile's own addressed rule.", "",
+          "| Files | Count | Changed after the review |", "|---|---|---|",
+          f"| Greptile commented on it | {f_n} | **{100 * f_rate:.1f}%** |", f"| Greptile did not comment on it | {u_n} | **{100 * u_rate:.1f}%** |", "",
+          f"**Churn-adjusted effect of a comment: {100 * (f_rate - u_rate):+.1f} points** (95% CI {100 * lo:+.1f} to {100 * hi:+.1f}, bootstrap over PRs).", "",
+          "Split by how busy the file already was, since Greptile may comment more on files developers were already working on:", "",
+          "| Files | Commented, changed after | Not commented, changed after | Difference |", "|---|---|---|---|"]
+    for name, a, an, b, bn in strata:
+        if an and bn: md.append(f"| {name} | {100 * a:.1f}% (n={an}) | {100 * b:.1f}% (n={bn}) | {100 * (a - b):+.1f} |")
+    md += ["", "## Honest limits", "",
+           "- Not a randomized test. Greptile chooses where to comment, and those files may differ in ways the busy-file split doesn't capture.",
+           "- A file changed after a comment may have changed for another reason, and a comment can be addressed by editing a different file.",
+           "- Public repos only. Reviews are timed by Greptile's first inline comment on each PR."]
+    out = "\n".join(md); (ROOT / "results").mkdir(exist_ok=True); (ROOT / "results" / f"control-{dt.date.today()}.md").write_text(out, encoding="utf-8"); print(out)
+
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser(); ap.add_argument("cmd", choices=["collect", "label", "evaluate"]); ap.add_argument("--max-prs", type=int, default=1000)
+    ap = argparse.ArgumentParser(); ap.add_argument("cmd", choices=["collect", "label", "evaluate", "timeline", "control"]); ap.add_argument("--max-prs", type=int, default=1000)
     a = ap.parse_args()
     if a.cmd == "collect": collect(a.max_prs)
     elif a.cmd == "label": label()
+    elif a.cmd == "timeline": timeline()
+    elif a.cmd == "control": control()
     else: evaluate()
