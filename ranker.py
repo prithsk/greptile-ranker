@@ -8,6 +8,7 @@ ranker. The question: keeping 90% of the comments developers address, how much o
   python ranker.py evaluate
 """
 import argparse, collections, json, math, random, re, time, datetime as dt
+from pathlib import Path
 import requests
 from common import ROOT, need, os
 
@@ -37,11 +38,18 @@ def collect(max_prs):
     seen = set()
     if DATA.exists():
         for l in DATA.read_text(encoding="utf-8").splitlines(): seen.add(json.loads(l)["pr"])
-    prs, page = [], 1
-    while len(prs) < max_prs and page <= 10:
-        res = get(f"{API}/search/issues", q="commenter:greptile-apps[bot] is:pr is:merged is:public", per_page=100, page=page)
-        prs += [i for i in res.get("items", []) if i["html_url"] not in seen]; page += 1
-        if not res.get("items"): break
+    prs, found = [], set(seen)
+    end = dt.date.today()
+    for _ in range(18):                               # one month at a time; each search caps at 1000 results
+        start = end - dt.timedelta(days=30)
+        for page in range(1, 11):
+            res = get(f"{API}/search/issues", q=f"commenter:greptile-apps[bot] is:pr is:merged is:public merged:{start}..{end}", per_page=100, page=page)
+            items = [i for i in res.get("items", []) if i["html_url"] not in found]
+            for i in items: found.add(i["html_url"])
+            prs += items
+            if len(res.get("items", [])) < 100 or len(prs) >= max_prs: break
+        if len(prs) >= max_prs: break
+        end = start
     with DATA.open("a", encoding="utf-8") as out:
         for n, item in enumerate(prs[:max_prs], 1):
             repo = "/".join(item["repository_url"].split("/")[-2:]); num = item["number"]
@@ -60,7 +68,37 @@ def collect(max_prs):
                                       "idx": i, "n_in_pr": len(comments), "addressed": int(addressed)}) + "\n")
             print(f"  {n}/{len(prs[:max_prs])} {repo}#{num}: {len(comments)} comments", flush=True)
 
-def features(r):
+LABELS = ROOT / "data" / "llm_labels.jsonl"
+GRADE = """You are grading one automated code review comment. File: {path}
+Comment:
+{body}
+
+Reply with only JSON: {{"severity": 1-5, "concrete": true or false}}
+severity: 1 = style nit or naming, 2 = minor cleanup, 3 = likely real issue, 4 = real bug, 5 = definite bug, crash or security hole.
+concrete: true only if the comment names the exact problem and a specific fix."""
+
+def _key(r): return r["pr"] + "|" + str(r["idx"])
+
+def label(model="gpt-4o-mini"):
+    need("OPENAI_API_KEY")
+    from openai import OpenAI
+    client = OpenAI(); rows = [json.loads(l) for l in DATA.read_text(encoding="utf-8").splitlines()]
+    done = {json.loads(l)["key"] for l in LABELS.read_text(encoding="utf-8").splitlines()} if LABELS.exists() else set()
+    with LABELS.open("a", encoding="utf-8") as out:
+        for n, r in enumerate(rows, 1):
+            if _key(r) in done: continue
+            txt = client.chat.completions.create(model=model, temperature=0, max_tokens=40, response_format={"type": "json_object"},
+                    messages=[{"role": "user", "content": GRADE.format(path=r["path"], body=r["body"][:3000])}]).choices[0].message.content
+            try: j = json.loads(txt); sev = int(j.get("severity", 3)); con = bool(j.get("concrete", False))
+            except Exception: sev, con = 3, False
+            out.write(json.dumps({"key": _key(r), "severity": max(1, min(5, sev)), "concrete": con}) + "\n")
+            if n % 25 == 0: print(f"  graded {n}/{len(rows)}", flush=True)
+
+def load_labels():
+    if not LABELS.exists(): return {}
+    return {j["key"]: j for j in (json.loads(l) for l in LABELS.read_text(encoding="utf-8").splitlines())}
+
+def features(r, llm=None):
     b = r["body"].lower(); f = {}
     f["bias"] = 1.0
     f["log_len"] = math.log1p(len(b)) / 8
@@ -74,6 +112,8 @@ def features(r):
     f["first_in_pr"] = float(r["idx"] == 0)
     f["log_n_in_pr"] = math.log1p(r["n_in_pr"]) / 4
     f["rel_position"] = r["idx"] / max(1, r["n_in_pr"] - 1)
+    if llm is not None:
+        f["llm_severity"] = (llm.get("severity", 3) - 1) / 4; f["llm_concrete"] = float(llm.get("concrete", False))
     return f
 
 def train(X, y, epochs=300, lr=0.5, l2=1e-3):
@@ -110,37 +150,63 @@ def cut_at_recall(scores, y, target=0.9):
                     "noise_cut": dropped_neg / N if N else float("nan"), "precision_kept": kept_pos / len(kept)}
     return {}
 
-def evaluate(folds=5, seed=3):
-    rows = [json.loads(l) for l in DATA.read_text(encoding="utf-8").splitlines()]
-    repos = sorted({r["repo"] for r in rows}); random.Random(seed).shuffle(repos)
-    fold_of = {r: i % folds for i, r in enumerate(repos)}        # whole repos held out: no leakage across a codebase
-    scores, ys = [None] * len(rows), [r["addressed"] for r in rows]
+def _cv_scores(rows, ys, fold_of, folds, featfn):
+    scores = [None] * len(rows)
     for k in range(folds):
         tr = [i for i, r in enumerate(rows) if fold_of[r["repo"]] != k]; te = [i for i, r in enumerate(rows) if fold_of[r["repo"]] == k]
         if not tr or not te: continue
-        w = train([features(rows[i]) for i in tr], [ys[i] for i in tr])
-        for i in te: scores[i] = score(w, features(rows[i]))
-    idx = [i for i, s in enumerate(scores) if s is not None]; s = [scores[i] for i in idx]; y = [ys[i] for i in idx]
-    w_all = train([features(r) for r in rows], ys)
-    top = sorted(((v, k) for k, v in w_all.items() if k != "bias"), reverse=True)
-    res = {"comments": len(rows), "repos": len(repos), "prs": len({r["pr"] for r in rows}), "addressed_rate": sum(ys) / len(ys),
-           "auc": auc(s, y), "at_90_recall": cut_at_recall(s, y, 0.9), "top_up": top[:3], "top_down": top[-3:]}
-    c = res["at_90_recall"]
-    md = "\n".join([f"# Greptile comment ranker, {dt.date.today()}", "",
-        f"{res['comments']} Greptile review comments from {res['prs']} merged PRs across {res['repos']} public repos. Addressed rate: {100*res['addressed_rate']:.1f}%.", "",
-        "Evaluated with whole repos held out, five folds, so the ranker never sees the codebase it scores.", "",
-        "| Metric | Value |", "|---|---|", f"| AUC | {res['auc']:.3f} |",
-        f"| Keeping 90% of addressed comments, unaddressed comments cut | **{100*c.get('noise_cut', float('nan')):.1f}%** ({c.get('dropped_unaddressed')}/{c.get('unaddressed')}) |",
-        f"| Share of kept comments that get addressed | {100*c.get('precision_kept', float('nan')):.1f}% vs {100*res['addressed_rate']:.1f}% for all |", "",
-        "Strongest signals toward addressed: " + ", ".join(f"`{k}` ({v:+.2f})" for v, k in res["top_up"]),
-        "", "Strongest signals against: " + ", ".join(f"`{k}` ({v:+.2f})" for v, k in res["top_down"]), "",
-        "## Honest limits", "",
-        "- \"Addressed\" means a later commit touched the flagged file, which is Greptile's own heuristic. A developer can touch a file for an unrelated reason or fix the issue elsewhere.",
-        "- Public repos only, and only repos where Greptile comments on merged PRs. Private teams may behave differently.",
-        "- A plain logistic model on surface features. It shows the signal is there, not the ceiling."])
-    (ROOT / "results").mkdir(exist_ok=True); (ROOT / "results" / f"{dt.date.today()}.md").write_text(md, encoding="utf-8"); print(md)
+        w = train([featfn(rows[i]) for i in tr], [ys[i] for i in tr])
+        for i in te: scores[i] = score(w, featfn(rows[i]))
+    idx = [i for i, s in enumerate(scores) if s is not None]
+    return [scores[i] for i in idx], [ys[i] for i in idx]
+
+def _rate(rows, pick):
+    g = [r["addressed"] for r in rows if pick(r)]; return (sum(g) / len(g), len(g)) if g else (float("nan"), 0)
+
+def evaluate(folds=5, seed=3, data=None, out_dir=None):
+    data = data or DATA; out_dir = out_dir or (ROOT / "results")
+    rows = [json.loads(l) for l in Path(data).read_text(encoding="utf-8").splitlines()]
+    labels = load_labels() if data == DATA else {}
+    repos = sorted({r["repo"] for r in rows}); random.Random(seed).shuffle(repos)
+    fold_of = {r: i % folds for i, r in enumerate(repos)}        # whole repos held out: no leakage across a codebase
+    ys = [r["addressed"] for r in rows]; base = sum(ys) / len(ys)
+    runs = {"Surface features": lambda r: features(r)}
+    if labels and all(_key(r) in labels for r in rows):
+        runs["Surface + LLM grades"] = lambda r: features(r, labels[_key(r)])
+    res = {}
+    for name, fn in runs.items():
+        s_, y_ = _cv_scores(rows, ys, fold_of, folds, fn); res[name] = {"auc": auc(s_, y_), "cut": cut_at_recall(s_, y_, 0.9)}
+    groups = [("Hedged (might, consider, maybe)", lambda r: any(w in r["body"].lower() for w in HEDGE)),
+              ("Not hedged", lambda r: not any(w in r["body"].lower() for w in HEDGE)),
+              ("Style or naming", lambda r: any(w in r["body"].lower() for w in CATS["style"])),
+              ("Has a suggested code change", lambda r: "```suggestion" in r["body"].lower()),
+              ("First comment on the PR", lambda r: r["idx"] == 0), ("Later comments on the PR", lambda r: r["idx"] > 0)]
+    if labels:
+        groups += [("LLM severity 4-5 (real bug)", lambda r: labels.get(_key(r), {}).get("severity", 0) >= 4),
+                   ("LLM severity 1-2 (nit or cleanup)", lambda r: 0 < labels.get(_key(r), {}).get("severity", 0) <= 2),
+                   ("LLM says concrete fix", lambda r: labels.get(_key(r), {}).get("concrete") is True)]
+    md = [f"# Greptile comment ranker, {dt.date.today()}", "",
+          f"{len(rows)} Greptile review comments from {len({r['pr'] for r in rows})} merged PRs across {len(repos)} public repos. Addressed rate: {100 * base:.1f}%.", "",
+          "Evaluated with whole repos held out, five folds, so the ranker never sees the codebase it scores.", "",
+          "| Ranker | AUC | Unaddressed cut at 90% recall | Kept comments addressed |", "|---|---|---|---|"]
+    for name, r in res.items():
+        c = r["cut"]
+        md.append(f"| {name} | {r['auc']:.3f} | {100 * c.get('noise_cut', float('nan')):.1f}% ({c.get('dropped_unaddressed')}/{c.get('unaddressed')}) | {100 * c.get('precision_kept', float('nan')):.1f}% vs {100 * base:.1f}% |")
+    md += ["", "## Addressed rate by comment type", "", "| Comments | Count | Addressed |", "|---|---|---|"]
+    for name, pick in groups:
+        rt, n = _rate(rows, pick)
+        if n: md.append(f"| {name} | {n} | {100 * rt:.1f}% |")
+    md += ["", "## Honest limits", "",
+           "- \"Addressed\" means a later commit touched the flagged file, which is Greptile's own heuristic. A developer can touch a file for an unrelated reason or fix the issue elsewhere.",
+           "- Public repos only, and only repos where Greptile comments on merged PRs. Private teams may behave differently.",
+           "- An AUC near 0.5 means no better than chance. Group rates on small counts are noisy; the count column says how much to trust each row.",
+           "- LLM grades come from gpt-4o-mini reading only the comment text, not the code."]
+    out = "\n".join(md); Path(out_dir).mkdir(parents=True, exist_ok=True); (Path(out_dir) / f"{dt.date.today()}.md").write_text(out, encoding="utf-8"); print(out)
     return res
 
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser(); ap.add_argument("cmd", choices=["collect", "evaluate"]); ap.add_argument("--max-prs", type=int, default=400)
-    a = ap.parse_args(); collect(a.max_prs) if a.cmd == "collect" else evaluate()
+    ap = argparse.ArgumentParser(); ap.add_argument("cmd", choices=["collect", "label", "evaluate"]); ap.add_argument("--max-prs", type=int, default=1000)
+    a = ap.parse_args()
+    if a.cmd == "collect": collect(a.max_prs)
+    elif a.cmd == "label": label()
+    else: evaluate()
