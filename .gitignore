@@ -1,0 +1,6 @@
+.env
+data/
+cache/
+parses/
+results/raw.json
+__pycache__/
